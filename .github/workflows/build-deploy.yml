@@ -14,49 +14,6 @@ on:
           - sandbox
           - prod
         default: dev
-      aws_region:
-        description: AWS region used for role/session
-        required: true
-        type: choice
-        options:
-          - ca-central-1
-          - us-east-1
-        default: ca-central-1
-      env_variables_secret_prefix:
-        description: Secret path segment for env vars (<env>/<prefix>/env-variables)
-        required: true
-        type: string
-        default: eapi
-      app_name:
-        description: App suffix used in env key (<env>_<app_name>)
-        required: true
-        type: string
-        default: orbit-enterpriseapi-tails
-      env_secret_key:
-        description: Optional explicit key override inside env-variables JSON
-        required: false
-        type: string
-        default: ""
-      cicd_config_secret_id:
-        description: Secret ARN/name containing deploy role and EC2 instance id
-        required: false
-        type: string
-        default: arn:aws:secretsmanager:us-east-1:575266917932:secret:cicd/configuration
-      deploy_path:
-        description: Target directory on EC2 for compose + .env
-        required: true
-        type: string
-        default: /home/ubuntu/eapi/orbit-enterpriseapi-tails
-      compose_source_file:
-        description: Compose file in this repository
-        required: true
-        type: string
-        default: docker/docker-compose.yml
-      compose_target_file:
-        description: Compose file name on EC2 deploy path
-        required: true
-        type: string
-        default: docker-compose.yml
 
 permissions:
   contents: read
@@ -64,7 +21,12 @@ permissions:
 
 env:
   TARGET_ENV: ${{ inputs.environment }}
-  TARGET_AWS_REGION: ${{ inputs.aws_region }}
+  TARGET_AWS_REGION: ca-central-1
+  ENV_VARIABLES_SECRET_PREFIX: eapi
+  APP_NAME: orbit-enterpriseapi-tails
+  CICD_CONFIG_SECRET_ID: arn:aws:secretsmanager:us-east-1:575266917932:secret:cicd/configuration
+  DEPLOY_PATH: /home/ubuntu/eapi/orbit-enterpriseapi-tails
+  COMPOSE_RELATIVE_PATH: docker/docker-compose.yml
 
 jobs:
   deploy:
@@ -79,8 +41,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f "${{ inputs.compose_source_file }}" || {
-            echo "::error::Compose file not found: ${{ inputs.compose_source_file }}"
+          test -f "${{ env.COMPOSE_RELATIVE_PATH }}" || {
+            echo "::error::Compose file not found: ${{ env.COMPOSE_RELATIVE_PATH }}"
             exit 1
           }
 
@@ -98,7 +60,7 @@ jobs:
           set -euo pipefail
 
           if CONFIG_JSON=$(aws secretsmanager get-secret-value \
-            --secret-id "${{ inputs.cicd_config_secret_id }}" \
+            --secret-id "${{ env.CICD_CONFIG_SECRET_ID }}" \
             --query SecretString --output text \
             --region us-east-1 2>/dev/null); then
             echo "::notice::Loaded CICD config from configured secret."
@@ -143,18 +105,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SECRET_ID="${{ env.TARGET_ENV }}/${{ inputs.env_variables_secret_prefix }}/env-variables"
+          SECRET_ID="${{ env.TARGET_ENV }}/${{ env.ENV_VARIABLES_SECRET_PREFIX }}/env-variables"
 
           RAW_ENV_JSON=$(aws secretsmanager get-secret-value \
             --secret-id "$SECRET_ID" \
             --query SecretString --output text \
             --region us-east-1)
 
-          DEFAULT_KEY="${{ env.TARGET_ENV }}_${{ inputs.app_name }}"
-          KEY="${{ inputs.env_secret_key }}"
-          if [ -z "$KEY" ]; then
-            KEY="$DEFAULT_KEY"
-          fi
+          KEY="${{ env.TARGET_ENV }}_${{ env.APP_NAME }}"
 
           echo "::notice::Reading env key '$KEY' from '$SECRET_ID'"
           SELECTED=$(echo "$RAW_ENV_JSON" | jq -rc --arg k "$KEY" '.[$k] // empty')
@@ -173,36 +131,55 @@ jobs:
           ' > .env
 
           if [ ! -s .env ]; then
-            echo "::error::.env content is empty. Check secret format and env_secret_key."
+            echo "::error::.env content is empty. Check secret format for key $KEY."
             exit 1
           fi
 
           echo "env_b64=$(base64 -w 0 .env)" >> "$GITHUB_OUTPUT"
-          echo "compose_b64=$(base64 -w 0 "${{ inputs.compose_source_file }}")" >> "$GITHUB_OUTPUT"
+          ARCHIVE_PATH="$(mktemp /tmp/orbit-enterpriseapi-tails-XXXXXX.tar.gz)"
+          tar --warning=no-file-changed \
+            --exclude-vcs \
+            --exclude='node_modules' \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='repo.tar.gz' \
+            --exclude='*.tar.gz' \
+            -czf "$ARCHIVE_PATH" .
+          REPO_BYTES=$(wc -c < "$ARCHIVE_PATH" | awk '{print $1}')
+          echo "::notice::Compressed repo payload size: ${REPO_BYTES} bytes"
+          if [ "$REPO_BYTES" -gt 300000 ]; then
+            echo "::error::Repository payload is too large for reliable SSM inline transfer (${REPO_BYTES} bytes)."
+            echo "::error::Reduce payload size or switch to pull-from-git/S3 sync on EC2."
+            exit 1
+          fi
+          echo "repo_b64=$(base64 -w 0 "$ARCHIVE_PATH")" >> "$GITHUB_OUTPUT"
+          rm -f "$ARCHIVE_PATH"
 
-      - name: Deploy compose and env through AWS SSM
+      - name: Sync repo and deploy compose through AWS SSM
         shell: bash
         run: |
           set -euo pipefail
 
           TARGET_INSTANCE="${{ steps.config.outputs.ec2_instance_id }}"
           TARGET_REGION="${{ steps.config.outputs.deploy_region }}"
-          DEPLOY_PATH="${{ inputs.deploy_path }}"
-          COMPOSE_TARGET="${{ inputs.compose_target_file }}"
+          DEPLOY_PATH="${{ env.DEPLOY_PATH }}"
+          COMPOSE_RELATIVE_PATH="${{ env.COMPOSE_RELATIVE_PATH }}"
           ENV_B64='${{ steps.envfile.outputs.env_b64 }}'
-          COMPOSE_B64='${{ steps.envfile.outputs.compose_b64 }}'
+          REPO_B64='${{ steps.envfile.outputs.repo_b64 }}'
 
           REMOTE_SCRIPT=$(mktemp)
           {
             printf '%s\n' 'set -eu'
             printf '%s\n' "sudo mkdir -p \"$DEPLOY_PATH\""
-            printf '%s\n' "cd \"$DEPLOY_PATH\""
-            printf '%s\n' "echo \"$ENV_B64\" | base64 -d > .env"
-            printf '%s\n' "chmod 600 .env"
-            printf '%s\n' "echo \"$COMPOSE_B64\" | base64 -d > \"$COMPOSE_TARGET\""
-            printf '%s\n' "sudo docker compose -f \"$COMPOSE_TARGET\" down || true"
-            printf '%s\n' "sudo docker compose -f \"$COMPOSE_TARGET\" up -d"
-            printf '%s\n' "sudo docker compose -f \"$COMPOSE_TARGET\" ps"
+            printf '%s\n' "echo \"$REPO_B64\" | base64 -d > /tmp/orbit-enterpriseapi-tails.tar.gz"
+            printf '%s\n' "sudo rm -rf \"$DEPLOY_PATH\"/*"
+            printf '%s\n' "sudo tar -xzf /tmp/orbit-enterpriseapi-tails.tar.gz -C \"$DEPLOY_PATH\""
+            printf '%s\n' "sudo rm -f /tmp/orbit-enterpriseapi-tails.tar.gz"
+            printf '%s\n' "echo \"$ENV_B64\" | base64 -d | sudo tee \"$DEPLOY_PATH/docker/.env\" >/dev/null"
+            printf '%s\n' "sudo chmod 600 \"$DEPLOY_PATH/docker/.env\""
+            printf '%s\n' "sudo docker compose -f \"$DEPLOY_PATH/$COMPOSE_RELATIVE_PATH\" down || true"
+            printf '%s\n' "sudo docker compose -f \"$DEPLOY_PATH/$COMPOSE_RELATIVE_PATH\" up -d --build"
+            printf '%s\n' "sudo docker compose -f \"$DEPLOY_PATH/$COMPOSE_RELATIVE_PATH\" ps"
           } > "$REMOTE_SCRIPT"
 
           jq -n --rawfile script "$REMOTE_SCRIPT" '{commands: [$script]}' > commands.json
