@@ -1,6 +1,9 @@
 name: Deploy tails-server to EC2
 
 on:
+  push:
+    branches:
+      - fix/deployments
   workflow_dispatch:
     inputs:
       environment:
@@ -13,7 +16,7 @@ on:
           - stg
           - sandbox
           - prod
-        default: dev
+        default: qa
 
 permissions:
   contents: read
