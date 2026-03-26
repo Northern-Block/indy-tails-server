@@ -1,6 +1,9 @@
 name: Deploy tails-server to EC2
 
 on:
+  push:
+    branches:
+      - fix/deployments
   workflow_dispatch:
     inputs:
       environment:
@@ -13,7 +16,7 @@ on:
           - stg
           - sandbox
           - prod
-        default: dev
+        default: qa
 
 permissions:
   contents: read
@@ -136,15 +139,24 @@ jobs:
           fi
 
           echo "env_b64=$(base64 -w 0 .env)" >> "$GITHUB_OUTPUT"
-          tar --exclude-vcs --exclude='node_modules' -czf repo.tar.gz .
-          REPO_BYTES=$(wc -c < repo.tar.gz | awk '{print $1}')
+          ARCHIVE_PATH="$(mktemp /tmp/orbit-enterpriseapi-tails-XXXXXX.tar.gz)"
+          tar --warning=no-file-changed \
+            --exclude-vcs \
+            --exclude='node_modules' \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='repo.tar.gz' \
+            --exclude='*.tar.gz' \
+            -czf "$ARCHIVE_PATH" .
+          REPO_BYTES=$(wc -c < "$ARCHIVE_PATH" | awk '{print $1}')
           echo "::notice::Compressed repo payload size: ${REPO_BYTES} bytes"
           if [ "$REPO_BYTES" -gt 300000 ]; then
             echo "::error::Repository payload is too large for reliable SSM inline transfer (${REPO_BYTES} bytes)."
             echo "::error::Reduce payload size or switch to pull-from-git/S3 sync on EC2."
             exit 1
           fi
-          echo "repo_b64=$(base64 -w 0 repo.tar.gz)" >> "$GITHUB_OUTPUT"
+          echo "repo_b64=$(base64 -w 0 "$ARCHIVE_PATH")" >> "$GITHUB_OUTPUT"
+          rm -f "$ARCHIVE_PATH"
 
       - name: Sync repo and deploy compose through AWS SSM
         shell: bash
