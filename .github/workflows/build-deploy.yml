@@ -1,0 +1,258 @@
+name: Deploy tails-server to EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - stg
+          - sandbox
+          - prod
+        default: dev
+      aws_region:
+        description: AWS region used for role/session
+        required: true
+        type: choice
+        options:
+          - ca-central-1
+          - us-east-1
+        default: ca-central-1
+      env_variables_secret_prefix:
+        description: Secret path segment for env vars (<env>/<prefix>/env-variables)
+        required: true
+        type: string
+        default: eapi
+      app_name:
+        description: App suffix used in env key (<env>_<app_name>)
+        required: true
+        type: string
+        default: orbit-enterpriseapi-tails
+      env_secret_key:
+        description: Optional explicit key override inside env-variables JSON
+        required: false
+        type: string
+        default: ""
+      cicd_config_secret_id:
+        description: Secret ARN/name containing deploy role and EC2 instance id
+        required: false
+        type: string
+        default: arn:aws:secretsmanager:us-east-1:575266917932:secret:cicd/configuration
+      deploy_path:
+        description: Target directory on EC2 for compose + .env
+        required: true
+        type: string
+        default: /home/ubuntu/eapi/orbit-enterpriseapi-tails
+      compose_source_file:
+        description: Compose file in this repository
+        required: true
+        type: string
+        default: docker/docker-compose.yml
+      compose_target_file:
+        description: Compose file name on EC2 deploy path
+        required: true
+        type: string
+        default: docker-compose.yml
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TARGET_ENV: ${{ inputs.environment }}
+  TARGET_AWS_REGION: ${{ inputs.aws_region }}
+
+jobs:
+  deploy:
+    name: Deploy via AWS SSM
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate compose file exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${{ inputs.compose_source_file }}" || {
+            echo "::error::Compose file not found: ${{ inputs.compose_source_file }}"
+            exit 1
+          }
+
+      - name: Configure AWS credentials (config reader)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::575266917932:role/GitHubActionsCICD
+          aws-region: ${{ env.TARGET_AWS_REGION }}
+          role-session-name: GitHubActions-Config
+
+      - name: Load deployment configuration from Secrets Manager
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if CONFIG_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "${{ inputs.cicd_config_secret_id }}" \
+            --query SecretString --output text \
+            --region us-east-1 2>/dev/null); then
+            echo "::notice::Loaded CICD config from configured secret."
+          else
+            CONFIG_JSON=$(aws secretsmanager get-secret-value \
+              --secret-id cicd/configuration \
+              --query SecretString --output text \
+              --region us-east-1)
+            echo "::warning::Fell back to cicd/configuration."
+          fi
+
+          DEPLOY_ROLE_KEY="${{ env.TARGET_ENV }}_aws_role"
+          EC2_INSTANCE_KEY="${{ env.TARGET_ENV }}_ec2_instance_id"
+          DEPLOY_REGION_KEY="${{ env.TARGET_ENV }}_aws_region"
+
+          DEPLOY_ROLE=$(echo "$CONFIG_JSON" | jq -r --arg k "$DEPLOY_ROLE_KEY" '.[$k] // .aws_role_arn // empty')
+          EC2_INSTANCE_ID=$(echo "$CONFIG_JSON" | jq -r --arg k "$EC2_INSTANCE_KEY" '.[$k] // empty')
+          DEPLOY_REGION=$(echo "$CONFIG_JSON" | jq -r --arg k "$DEPLOY_REGION_KEY" --arg d "${{ env.TARGET_AWS_REGION }}" '.[$k] // $d')
+
+          if [ -z "$DEPLOY_ROLE" ] || [ "$DEPLOY_ROLE" = "null" ]; then
+            echo "::error::Missing deploy role in secret. Expected key: $DEPLOY_ROLE_KEY or aws_role_arn"
+            exit 1
+          fi
+          if [ -z "$EC2_INSTANCE_ID" ] || [ "$EC2_INSTANCE_ID" = "null" ]; then
+            echo "::error::Missing EC2 instance id in secret. Expected key: $EC2_INSTANCE_KEY"
+            exit 1
+          fi
+
+          echo "deploy_role_arn=$DEPLOY_ROLE" >> "$GITHUB_OUTPUT"
+          echo "ec2_instance_id=$EC2_INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "deploy_region=$DEPLOY_REGION" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.config.outputs.deploy_role_arn }}
+          aws-region: ${{ steps.config.outputs.deploy_region }}
+          role-session-name: GitHubActions-Deploy
+
+      - name: Build .env content from Secrets Manager
+        id: envfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          SECRET_ID="${{ env.TARGET_ENV }}/${{ inputs.env_variables_secret_prefix }}/env-variables"
+
+          RAW_ENV_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID" \
+            --query SecretString --output text \
+            --region us-east-1)
+
+          DEFAULT_KEY="${{ env.TARGET_ENV }}_${{ inputs.app_name }}"
+          KEY="${{ inputs.env_secret_key }}"
+          if [ -z "$KEY" ]; then
+            KEY="$DEFAULT_KEY"
+          fi
+
+          echo "::notice::Reading env key '$KEY' from '$SECRET_ID'"
+          SELECTED=$(echo "$RAW_ENV_JSON" | jq -rc --arg k "$KEY" '.[$k] // empty')
+          if [ -z "$SELECTED" ] || [ "$SELECTED" = "null" ]; then
+            echo "::error::Key '$KEY' not found in $SECRET_ID"
+            echo "::error::Expected format: <env>_<app_name> (ex: dev_orbit-enterpriseapi-tails)"
+            exit 1
+          fi
+          ENV_JSON="$SELECTED"
+
+          echo "$ENV_JSON" | jq -r '
+            if type == "string" then fromjson else . end
+            | to_entries
+            | .[]
+            | .key + "=" + (.value | tostring)
+          ' > .env
+
+          if [ ! -s .env ]; then
+            echo "::error::.env content is empty. Check secret format and env_secret_key."
+            exit 1
+          fi
+
+          echo "env_b64=$(base64 -w 0 .env)" >> "$GITHUB_OUTPUT"
+          echo "compose_b64=$(base64 -w 0 "${{ inputs.compose_source_file }}")" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy compose and env through AWS SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_INSTANCE="${{ steps.config.outputs.ec2_instance_id }}"
+          TARGET_REGION="${{ steps.config.outputs.deploy_region }}"
+          DEPLOY_PATH="${{ inputs.deploy_path }}"
+          COMPOSE_TARGET="${{ inputs.compose_target_file }}"
+          ENV_B64='${{ steps.envfile.outputs.env_b64 }}'
+          COMPOSE_B64='${{ steps.envfile.outputs.compose_b64 }}'
+
+          REMOTE_SCRIPT=$(mktemp)
+          {
+            printf '%s\n' 'set -eu'
+            printf '%s\n' "sudo mkdir -p \"$DEPLOY_PATH\""
+            printf '%s\n' "cd \"$DEPLOY_PATH\""
+            printf '%s\n' "echo \"$ENV_B64\" | base64 -d > .env"
+            printf '%s\n' "chmod 600 .env"
+            printf '%s\n' "echo \"$COMPOSE_B64\" | base64 -d > \"$COMPOSE_TARGET\""
+            printf '%s\n' "sudo docker compose -f \"$COMPOSE_TARGET\" down || true"
+            printf '%s\n' "sudo docker compose -f \"$COMPOSE_TARGET\" up -d"
+            printf '%s\n' "sudo docker compose -f \"$COMPOSE_TARGET\" ps"
+          } > "$REMOTE_SCRIPT"
+
+          jq -n --rawfile script "$REMOTE_SCRIPT" '{commands: [$script]}' > commands.json
+          rm -f "$REMOTE_SCRIPT"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets "Key=instanceIds,Values=$TARGET_INSTANCE" \
+            --parameters file://commands.json \
+            --timeout-seconds 1800 \
+            --region "$TARGET_REGION" \
+            --query 'Command.CommandId' --output text)
+
+          if [ -z "$COMMAND_ID" ] || [ "$COMMAND_ID" = "None" ]; then
+            echo "::error::Failed to submit SSM command."
+            exit 1
+          fi
+          echo "::notice::SSM Command ID: $COMMAND_ID"
+
+          TIMEOUT=1800
+          ELAPSED=0
+          STATUS="Pending"
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$TARGET_INSTANCE" \
+              --region "$TARGET_REGION" \
+              --query 'Status' --output text 2>/dev/null || echo "InProgress")
+
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              break
+            fi
+
+            sleep 10
+            ELAPSED=$((ELAPSED + 10))
+          done
+
+          echo "=== SSM status: $STATUS ==="
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$TARGET_INSTANCE" \
+            --region "$TARGET_REGION" \
+            --query 'StandardOutputContent' --output text || true
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$TARGET_INSTANCE" \
+            --region "$TARGET_REGION" \
+            --query 'StandardErrorContent' --output text || true
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deployment failed with final status: $STATUS"
+            exit 1
+          fi
