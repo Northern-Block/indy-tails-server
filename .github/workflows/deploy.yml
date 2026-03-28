@@ -13,7 +13,8 @@ on:
           - stg
           - sandbox
           - prod
-        default: qa
+          - cs-prd
+        default: dev
 
 permissions:
   contents: read
@@ -21,7 +22,7 @@ permissions:
 
 env:
   TARGET_ENV: ${{ inputs.environment }}
-  TARGET_AWS_REGION: ca-central-1
+  TARGET_AWS_REGION: ${{ inputs.environment != '' && inputs.environment || (contains(fromJSON('["prd","PRD","Prd","prod","PROD","Prod","production","PRODUCTION","Production","cs-prd","CS-PRD","Cs-Prd","cs-prod","CS-PROD","Cs-Prod"]'), inputs.environment) && 'ca-central-1' || 'us-east-1') }}
   ENV_VARIABLES_SECRET_PREFIX: eapi
   APP_NAME: orbit-enterpriseapi-tails
   CICD_CONFIG_SECRET_ID: arn:aws:secretsmanager:us-east-1:575266917932:secret:cicd/configuration
@@ -110,7 +111,7 @@ jobs:
           RAW_ENV_JSON=$(aws secretsmanager get-secret-value \
             --secret-id "$SECRET_ID" \
             --query SecretString --output text \
-            --region us-east-1)
+            --region ${{ env.TARGET_AWS_REGION }})
 
           KEY="${{ env.TARGET_ENV }}_${{ env.APP_NAME }}"
 
