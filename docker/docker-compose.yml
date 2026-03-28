@@ -2,7 +2,7 @@ services:
   ngrok-tails-server:
     image: ngrok/ngrok
     networks:
-      - tails-server
+      - eapi-network
     ports:
       - 4044:4040
     command: start --all
@@ -18,7 +18,7 @@ services:
     ports:
       - 6543:6543
     networks:
-      - tails-server
+      - eapi-network
     command: >
       tails-server
         --host 0.0.0.0
@@ -31,4 +31,5 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.test
 networks:
-  tails-server:
+  eapi-network:
+    external: true
