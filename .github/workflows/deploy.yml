@@ -15,6 +15,11 @@ on:
           - prod
           - cs-prd
         default: dev
+      aws_region:
+        description: Optional AWS region (leave empty to route by environment)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -22,7 +27,7 @@ permissions:
 
 env:
   TARGET_ENV: ${{ inputs.environment }}
-  TARGET_AWS_REGION: ${{ inputs.environment != '' && inputs.environment || (contains(fromJSON('["prd","PRD","Prd","prod","PROD","Prod","production","PRODUCTION","Production","cs-prd","CS-PRD","Cs-Prd","cs-prod","CS-PROD","Cs-Prod"]'), inputs.environment) && 'ca-central-1' || 'us-east-1') }}
+  TARGET_AWS_REGION: ${{ inputs.aws_region != '' && inputs.aws_region || (contains(fromJSON('["prd","PRD","Prd","prod","PROD","Prod","production","PRODUCTION","Production","cs-prd","CS-PRD","Cs-Prd","cs-prod","CS-PROD","Cs-Prod"]'), inputs.environment) && 'ca-central-1' || 'us-east-1') }}
   ENV_VARIABLES_SECRET_PREFIX: eapi
   APP_NAME: orbit-enterpriseapi-tails
   CICD_CONFIG_SECRET_ID: arn:aws:secretsmanager:us-east-1:575266917932:secret:cicd/configuration
